@@ -14,10 +14,11 @@
 
 namespace jit {
 
-// In a regular JIT function spill-data is stored at negative offsets from RBP
-// and RBP points into the system stack. In JIT generators spilled data is still
-// stored backwards from RBP, but RBP points to a heap allocated block and this
-// persists when the generator is suspended.
+// In a regular JIT function spill-data is stored at negative offsets from the
+// frame pointer and the frame pointer points into the system stack. In JIT
+// generators spilled data is still stored backwards from the frame pointer, but
+// the frame pointer points to a heap allocated block and this persists when the
+// generator is suspended.
 //
 // While the content of spill data is arbitrary depending on the function, we
 // also have a few items of data about the current generator we want to access
@@ -36,12 +37,12 @@ namespace jit {
 // allocated for a generator rather than having it in a separate heap object.
 struct GenDataFooter {
   // Tools which examine/walk the stack expect the following two values to be
-  // ahead of RBP.
+  // ahead of the frame pointer.
   uint64_t linkAddress{};
   uint64_t returnAddress{};
 
-  // RBP that was swapped out to point to this spill-data.
-  uint64_t originalRbp{};
+  // Frame pointer that was swapped out to point to this spill-data.
+  uint64_t originalFramePointer{};
 
   // Static data specific to the current yield point. Only non-null when we are
   // suspended.

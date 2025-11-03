@@ -589,7 +589,7 @@ BB %6 - preds: %0
 )",
       PhyLocation{10, 64},
       PhyLocation{11, 64},
-      PhyLocation{7, 64});
+      PhyLocation{0, 64});
 #else
   auto lir_expected = fmt::format(
       R"(Function:

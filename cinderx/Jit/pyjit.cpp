@@ -2975,11 +2975,6 @@ PyFrameObject* _PyJIT_GetFrame(PyThreadState* tstate) {
 namespace jit {
 
 int initialize() {
-#ifndef __x86_64__
-  JIT_DLOG("JIT is not supported on non-x64 platforms");
-  return 0;
-#endif
-
   JIT_CHECK(
       getConfig().state != State::kFinalizing,
       "Trying to re-initialize the JIT as it is finalizing");
@@ -3012,10 +3007,10 @@ int initialize() {
   }
 
   // Do this check after config is initialized, so we can use JIT_DLOG().
-#ifndef __x86_64__
+#if !defined(__x86_64__) && !defined(__aarch64__)
   JIT_DLOG(
-      "JIT only supported x86-64 platforms, detected current architecture as "
-      "'{}'. Disabling the JIT.",
+      "JIT only supported x86-64 or aarch64 platforms, detected current "
+      "architecture as '{}'. Disabling the JIT.",
       getCpuArchName());
   return 0;
 #endif

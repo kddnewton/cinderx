@@ -7,6 +7,11 @@ namespace jit::codegen {
 #if defined(CINDER_X86_64)
 // Stack alignment requirement for x86-64
 constexpr size_t kConstStackAlignmentRequirement = 16;
+#elif defined(CINDER_AARCH64)
+// Stack alignment requirement for aarch64
+constexpr int32_t kConstStackAlignmentRequirement = 16;
+#else
+CINDER_UNSUPPORTED
 #endif
 
 RegisterPreserver::RegisterPreserver(
@@ -34,6 +39,22 @@ void RegisterPreserver::preserve() {
   if (align_stack_) {
     as_->push(asmjit::x86::rax);
   }
+#elif defined(CINDER_AARCH64)
+  for (const auto& pair : save_regs_) {
+    if (pair.first.isGpX()) {
+      as_->str(
+          static_cast<const asmjit::a64::Gp&>(pair.first),
+          asmjit::a64::ptr_pre(
+              asmjit::a64::sp, -kConstStackAlignmentRequirement));
+    } else if (pair.first.isVecD()) {
+      as_->str(
+          static_cast<const asmjit::a64::VecD&>(pair.first),
+          asmjit::a64::ptr_pre(
+              asmjit::a64::sp, -kConstStackAlignmentRequirement));
+    } else {
+      JIT_ABORT("unsupported saved register type");
+    }
+  }
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -56,6 +77,22 @@ void RegisterPreserver::remap() {
       }
     }
   }
+#elif defined(CINDER_AARCH64)
+  for (const auto& pair : save_regs_) {
+    if (pair.first != pair.second) {
+      if (pair.first.isGpX()) {
+        JIT_DCHECK(pair.second.isGpX(), "can't mix and match register types");
+        as_->mov(
+            static_cast<const asmjit::a64::Gp&>(pair.second),
+            static_cast<const asmjit::a64::Gp&>(pair.first));
+      } else if (pair.first.isVecD()) {
+        JIT_DCHECK(pair.second.isVecD(), "can't mix and match register types");
+        as_->fmov(
+            static_cast<const asmjit::a64::VecD&>(pair.second),
+            static_cast<const asmjit::a64::VecD&>(pair.first));
+      }
+    }
+  }
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -74,6 +111,22 @@ void RegisterPreserver::restore() {
           (asmjit::x86::Xmm&)iter->second,
           asmjit::x86::dqword_ptr(asmjit::x86::rsp));
       as_->add(asmjit::x86::rsp, 16);
+    } else {
+      JIT_ABORT("unsupported saved register type");
+    }
+  }
+#elif defined(CINDER_AARCH64)
+  for (auto iter = save_regs_.rbegin(); iter != save_regs_.rend(); ++iter) {
+    if (iter->second.isGpX()) {
+      as_->ldr(
+          static_cast<const asmjit::a64::Gp&>(iter->second),
+          asmjit::a64::ptr_post(
+              asmjit::a64::sp, kConstStackAlignmentRequirement));
+    } else if (iter->second.isVecD()) {
+      as_->ldr(
+          static_cast<const asmjit::a64::VecD&>(iter->second),
+          asmjit::a64::ptr_post(
+              asmjit::a64::sp, kConstStackAlignmentRequirement));
     } else {
       JIT_ABORT("unsupported saved register type");
     }
