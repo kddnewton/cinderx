@@ -208,7 +208,7 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
     if (target_opnd->isImm() || target_opnd->isMem()) {
       auto target = target_opnd->getConstantOrAddress();
       JIT_DCHECK(
-          fitsInt32(target),
+          fitsInt<32>(target),
           "Constant operand should fit in a 32-bit register, got {:x}.",
           target);
       as->cmp(reg_arg, target);
@@ -249,15 +249,91 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
       }
     }
   }
+#elif defined(CINDER_AARCH64)
+  auto as = env->as;
+
+  // the first four operands of the guard instruction are:
+  //   * kind
+  //   * deopt meta id
+  //   * guard var (physical register) (0 for AlwaysFail)
+  //   * target (for GuardIs and GuardType, and 0 for all others)
+
+  auto deopt_label = as->newLabel();
+  auto kind = instr->getInput(0)->getConstant();
+
+  arch::Gp reg = a64::x0;
+  bool is_double = false;
+  if (kind != kAlwaysFail) {
+    if (instr->getInput(2)->dataType() == jit::lir::OperandBase::kDouble) {
+      assert(kind == kNotZero);
+      auto vecd_reg = AutoTranslator::getVecD(instr->getInput(2));
+      as->umov(reg, vecd_reg);
+      as->cbz(reg, deopt_label);
+      is_double = true;
+    } else {
+      reg = AutoTranslator::getGp(instr->getInput(2));
+    }
+  }
+
+  auto emit_cmp = [&](auto reg_arg) {
+    constexpr size_t kTargetIndex = 3;
+    auto target_opnd = instr->getInput(kTargetIndex);
+    if (target_opnd->isImm() || target_opnd->isMem()) {
+      auto target = target_opnd->getConstantOrAddress();
+      JIT_DCHECK(
+          arm::Utils::isAddSubImm(target),
+          "Constant operand should fit in a 20-bit immediate, got {:x}.",
+          target);
+      as->cmp(reg_arg, target);
+    } else {
+      auto target_reg = AutoTranslator::getGp(target_opnd);
+      as->cmp(reg_arg, target_reg);
+    }
+  };
+
+  if (!is_double) {
+    switch (kind) {
+      case kNotZero: {
+        as->cbz(reg, deopt_label);
+        break;
+      }
+      case kNotNegative: {
+        as->cmp(reg, 0);
+        as->b_mi(deopt_label);
+        break;
+      }
+      case kZero: {
+        as->cbnz(reg, deopt_label);
+        break;
+      }
+      case kAlwaysFail:
+        as->b(deopt_label);
+        break;
+      case kIs:
+        emit_cmp(reg);
+        as->b_ne(deopt_label);
+        break;
+      case kHasType: {
+        as->ldr(
+            arch::reg_scratch_0,
+            arch::ptr_resolve(
+                as, reg, offsetof(PyObject, ob_type), arch::reg_scratch_0));
+
+        emit_cmp(arch::reg_scratch_0);
+        as->b_ne(deopt_label);
+        break;
+      }
+    }
+  }
+#else
+  CINDER_UNSUPPORTED
+#endif
 
   auto index = instr->getInput(1)->getConstant();
   // skip the first four inputs in Guard, which are
   // kind, deopt_meta id, guard var, and target.
   fillLiveValueLocations(env->code_rt, index, instr, 4, instr->getNumInputs());
   env->deopt_exits.emplace_back(index, deopt_label, instr);
-#else
-  CINDER_UNSUPPORTED
-#endif
 }
 
 void TranslateDeoptPatchpoint(Environ* env, const Instruction* instr) {
@@ -341,6 +417,69 @@ void TranslateCompare(Environ* env, const Instruction* instr) {
         AutoTranslator::getGp(instr->output()),
         asmjit::x86::gpb(instr->output()->getPhyRegister().loc));
   }
+#elif defined(CINDER_AARCH64)
+  auto as = env->as;
+  const OperandBase* inp0 = instr->getInput(0);
+  const OperandBase* inp1 = instr->getInput(1);
+
+  if (inp1->isMem()) {
+    auto address = inp1->getConstantOrAddress();
+    auto scratch = arch::reg_scratch_0;
+
+    as->mov(scratch, address);
+    as->ldr(scratch, a64::ptr(scratch));
+    as->cmp(AutoTranslator::getGp(inp0), scratch);
+  } else if (inp1->isImm()) {
+    auto constant = inp1->getConstantOrAddress();
+    auto scratch = arch::reg_scratch_0;
+
+    if (arm::Utils::isAddSubImm(constant)) {
+      as->cmp(AutoTranslator::getGp(inp0), constant);
+    } else {
+      as->mov(scratch, constant);
+      as->cmp(AutoTranslator::getGp(inp0), scratch);
+    }
+  } else if (!inp1->isVecD()) {
+    as->cmp(AutoTranslator::getGp(inp0), AutoTranslator::getGp(inp1));
+  } else {
+    as->fcmp(AutoTranslator::getVecD(inp0), AutoTranslator::getVecD(inp1));
+  }
+
+  auto output = AutoTranslator::getGp(instr->output());
+  switch (instr->opcode()) {
+    case Instruction::kEqual:
+      as->cset(output, arm::CondCode::kEQ);
+      break;
+    case Instruction::kNotEqual:
+      as->cset(output, arm::CondCode::kNE);
+      break;
+    case Instruction::kGreaterThanSigned:
+      as->cset(output, arm::CondCode::kGT);
+      break;
+    case Instruction::kGreaterThanEqualSigned:
+      as->cset(output, arm::CondCode::kGE);
+      break;
+    case Instruction::kLessThanSigned:
+      as->cset(output, arm::CondCode::kLT);
+      break;
+    case Instruction::kLessThanEqualSigned:
+      as->cset(output, arm::CondCode::kLE);
+      break;
+    case Instruction::kGreaterThanUnsigned:
+      as->cset(output, arm::CondCode::kHI);
+      break;
+    case Instruction::kGreaterThanEqualUnsigned:
+      as->cset(output, arm::CondCode::kHS);
+      break;
+    case Instruction::kLessThanUnsigned:
+      as->cset(output, arm::CondCode::kLO);
+      break;
+    case Instruction::kLessThanEqualUnsigned:
+      as->cset(output, arm::CondCode::kLS);
+      break;
+    default:
+      JIT_ABORT("bad instruction for TranslateCompare");
+  }
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -360,6 +499,20 @@ void translateIntToBool(Environ* env, const Instruction* instr) {
   } else {
     as->test(AutoTranslator::getGp(input), AutoTranslator::getGp(input));
     as->setne(output);
+  }
+#elif defined(CINDER_AARCH64)
+  a64::Builder* as = env->as;
+  const OperandBase* input = instr->getInput(0);
+  a64::Gp output = AutoTranslator::getGp(instr->output());
+  JIT_CHECK(
+      instr->output()->dataType() == OperandBase::k8bit,
+      "Output should be 8bits, not {}",
+      instr->output()->dataType());
+  if (input->isImm()) {
+    as->mov(output, input->getConstant() ? 1 : 0);
+  } else {
+    as->cmp(AutoTranslator::getGp(input), 0);
+    as->cset(output, a64::CondCode::kNE);
   }
 #else
   CINDER_UNSUPPORTED
@@ -411,6 +564,13 @@ void emitStoreGenYieldPoint(
   as->mov(scratch_r, reinterpret_cast<uint64_t>(gen_yield_point));
   auto yieldPointOffset = offsetof(GenDataFooter, yieldPoint);
   as->mov(x86::qword_ptr(suspend_data_r, yieldPointOffset), scratch_r);
+#elif defined(CINDER_AARCH64)
+  as->mov(scratch_r, reinterpret_cast<uint64_t>(gen_yield_point));
+  auto yieldPointOffset = offsetof(GenDataFooter, yieldPoint);
+  as->str(
+      scratch_r,
+      arch::ptr_resolve(
+          as, suspend_data_r, yieldPointOffset, arch::reg_scratch_0));
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -438,6 +598,34 @@ void emitLoadResumedYieldInputs(
     PhyLocation target_loc = target->getPhyRegister();
     if (target_loc != sent_in_source_loc) {
       as->mov(x86::gpq(target_loc.loc), x86::gpq(sent_in_source_loc.loc));
+    }
+    return;
+  }
+
+  JIT_CHECK(
+      target->isNone(),
+      "Have an output that isn't a register or a stack slot, {}",
+      target->type());
+#elif defined(CINDER_AARCH64)
+  PhyLocation tstate = instr->getInput(0)->getStackSlot();
+  as->str(
+      tstate_reg,
+      arch::ptr_resolve(as, arch::fp, tstate.loc, arch::reg_scratch_0));
+
+  const lir::Operand* target = instr->output();
+
+  if (target->isStack()) {
+    as->str(
+        a64::x(sent_in_source_loc.loc),
+        arch::ptr_resolve(
+            as, arch::fp, target->getStackSlot().loc, arch::reg_scratch_0));
+    return;
+  }
+
+  if (target->isReg()) {
+    PhyLocation target_loc = target->getPhyRegister();
+    if (target_loc != sent_in_source_loc) {
+      as->mov(a64::x(target_loc.loc), a64::x(sent_in_source_loc.loc));
     }
     return;
   }
@@ -554,6 +742,120 @@ void translateYieldInitial(Environ* env, const Instruction* instr) {
   // Sent in value is in RSI, and tstate is in RCX from resume entry-point args
   emitLoadResumedYieldInputs(as, instr, RSI, x86::rcx);
 #endif
+#elif defined(CINDER_AARCH64)
+#if PY_VERSION_HEX < 0x030C0000
+  arch::Builder* as = env->as;
+
+  // Load tstate into X0 for call to JITRT_MakeGenObject*.
+
+  // Consider avoiding reloading the tstate in from memory if it was already in
+  // a register before spilling. Still needs to be in memory though so it can be
+  // recovered after calling JITRT_MakeGenObject* which will trash it.
+  PhyLocation tstate = instr->getInput(0)->getStackSlot();
+  as->ldr(
+      a64::x0,
+      arch::ptr_resolve(as, arch::fp, tstate.loc, arch::reg_scratch_0));
+
+  // Make a generator object to be returned by the epilogue.
+  as->adr(a64::x1, env->gen_resume_entry_label);
+  JIT_CHECK(
+      env->shadow_frames_and_spill_size % kPointerSize == 0,
+      "Bad spill alignment");
+  as->mov(a64::x2, env->shadow_frames_and_spill_size / kPointerSize);
+  as->mov(a64::x3, reinterpret_cast<uint64_t>(env->code_rt));
+  JIT_CHECK(instr->origin()->IsInitialYield(), "expected InitialYield");
+  PyCodeObject* code = static_cast<const hir::InitialYield*>(instr->origin())
+                           ->frameState()
+                           ->code;
+  as->mov(a64::x4, reinterpret_cast<uint64_t>(code));
+  if (code->co_flags & CO_COROUTINE) {
+    emitCall(*env, reinterpret_cast<uint64_t>(JITRT_MakeGenObjectCoro), instr);
+  } else if (code->co_flags & CO_ASYNC_GENERATOR) {
+    emitCall(
+        *env, reinterpret_cast<uint64_t>(JITRT_MakeGenObjectAsyncGen), instr);
+  } else {
+    emitCall(*env, reinterpret_cast<uint64_t>(JITRT_MakeGenObject), instr);
+  }
+  // Resulting generator is now in X0 for filling in below and epilogue return.
+  const auto gen_reg = a64::x0;
+
+  // Exit early if return from JITRT_MakeGenObject was nullptr.
+  as->cbz(gen_reg, env->hard_exit_label);
+
+  // Set X9 to gen->gi_jit_data for use in emitStoreGenYieldPoint() and data
+  // copy below.
+  auto gi_jit_data_offset = offsetof(PyGenObject, gi_jit_data);
+  as->ldr(
+      arch::reg_scratch_0,
+      arch::ptr_resolve(as, gen_reg, gi_jit_data_offset, arch::reg_scratch_0));
+
+  // Arbitrary scratch register for use in emitStoreGenYieldPoint().
+  auto scratch_r = a64::x10;
+  asmjit::Label resume_label = as->newLabel();
+  emitStoreGenYieldPoint(
+      as, env, instr, resume_label, arch::reg_scratch_0, scratch_r);
+
+  // Store variables spilled by this point to generator.
+  int spill_bytes = env->initial_yield_spill_size_;
+  JIT_CHECK(spill_bytes % kPointerSize == 0, "Bad spill alignment");
+
+  // Point X11 at the bottom word of the current spill space.
+  as->sub(a64::x11, arch::fp, spill_bytes);
+  // Point X9 at the bottom word of the generator's spill space.
+  as->sub(arch::reg_scratch_0, arch::reg_scratch_0, spill_bytes);
+  as->mov(a64::x12, spill_bytes / kPointerSize);
+
+  asmjit::Label copy_loop = as->newLabel();
+  as->bind(copy_loop);
+  as->ldr(a64::x13, a64::ptr_post(a64::x11, kPointerSize));
+  as->str(a64::x13, a64::ptr_post(arch::reg_scratch_0, kPointerSize));
+  as->subs(a64::x12, a64::x12, 1);
+  as->b_ne(copy_loop);
+
+  // Jump to bottom half of epilogue
+  as->b(env->hard_exit_label);
+
+  // Resumed execution in this generator begins here
+  as->bind(resume_label);
+
+  // Sent in value is in X1, and tstate is in X3 from resume entry-point args
+  emitLoadResumedYieldInputs(as, instr, X1, a64::x3);
+#else
+  arch::Builder* as = env->as;
+
+  // Load tstate into X0 for call to
+  // JITRT_UnlinkGenFrameAndReturnGenDataFooter.
+
+  // Consider avoiding reloading the tstate in from memory if it was already in
+  // a register before spilling. Still needs to be in memory though so it can be
+  // recovered after calling JITRT_MakeGenObject* which will trash it.
+  PhyLocation tstate = instr->getInput(0)->getStackSlot();
+  as->ldr(
+      a64::x0,
+      arch::ptr_resolve(as, arch::fp, tstate.loc, arch::reg_scratch_0));
+
+  emitCall(
+      *env,
+      reinterpret_cast<uint64_t>(JITRT_UnlinkGenFrameAndReturnGenDataFooter),
+      instr);
+  // This will return pointers to a generator in X0 and JIT data in X1.
+
+  // Arbitrary scratch register for use in emitStoreGenYieldPoint(). Any
+  // caller-saved register not used in this scope will do because we're on the
+  // exit path now.
+  auto scratch_r = arch::reg_scratch_0;
+  asmjit::Label resume_label = as->newLabel();
+  emitStoreGenYieldPoint(as, env, instr, resume_label, a64::x1, scratch_r);
+
+  // Jump to epilogue
+  as->b(env->exit_for_yield_label);
+
+  // Resumed execution in this generator begins here
+  as->bind(resume_label);
+
+  // Sent in value is in X1, and tstate is in X3 from resume entry-point args
+  emitLoadResumedYieldInputs(as, instr, X1, a64::x3);
+#endif
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -588,6 +890,38 @@ void translateYieldValue(Environ* env, const Instruction* instr) {
 
   // Sent in value is in RSI, and tstate is in RCX from resume entry-point args
   emitLoadResumedYieldInputs(as, instr, RSI, x86::rcx);
+#elif defined(CINDER_AARCH64)
+  a64::Builder* as = env->as;
+
+  // Make sure tstate is in x2 for use in epilogue.
+  PhyLocation tstate = instr->getInput(0)->getStackSlot();
+  as->ldr(
+      a64::x2,
+      arch::ptr_resolve(as, arch::fp, tstate.loc, arch::reg_scratch_0));
+
+  // Value to send goes to x0 so it can be yielded (returned) by epilogue.
+  if (instr->getInput(1)->isImm()) {
+    as->mov(a64::x0, instr->getInput(1)->getConstant());
+  } else {
+    PhyLocation value_out = instr->getInput(1)->getStackSlot();
+    as->ldr(
+        a64::x0,
+        arch::ptr_resolve(as, arch::fp, value_out.loc, arch::reg_scratch_0));
+  }
+
+  // Arbitrary scratch register for use in emitStoreGenYieldPoint()
+  auto scratch_r = arch::reg_scratch_0;
+  auto resume_label = as->newLabel();
+  emitStoreGenYieldPoint(as, env, instr, resume_label, arch::fp, scratch_r);
+
+  // Jump to epilogue
+  as->b(env->exit_for_yield_label);
+
+  // Resumed execution in this generator begins here
+  as->bind(resume_label);
+
+  // Sent in value is in x1, and tstate is in x3 from resume entry-point args
+  emitLoadResumedYieldInputs(as, instr, X1, a64::x3);
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -666,6 +1000,86 @@ void translateYieldFrom(Environ* env, const Instruction* instr) {
   auto scratch_r = x86::r9;
   emitStoreGenYieldPoint(as, env, instr, resume_label, x86::rbp, scratch_r);
   as->jmp(env->exit_for_yield_label);
+
+  as->bind(done_label);
+  emitLoadResumedYieldInputs(as, instr, yf_result_phys_reg, tstate_phys_reg);
+#elif defined(CINDER_AARCH64)
+  arch::Builder* as = env->as;
+  bool skip_initial_send = instr->isYieldFromSkipInitialSend();
+
+  // Make sure tstate is in X0 for use in epilogue and here.
+  PhyLocation tstate = instr->getInput(0)->getStackSlot();
+  auto tstate_phys_reg = a64::x0;
+  as->ldr(
+      tstate_phys_reg,
+      arch::ptr_resolve(as, arch::fp, tstate.loc, arch::reg_scratch_0));
+
+  // If we're skipping the initial send the send value is actually the first
+  // value to yield and so needs to go into X0 to be returned. Otherwise,
+  // put initial send value in X1, the same location future send values will
+  // be on resume.
+  PhyLocation send_value = instr->getInput(1)->getStackSlot();
+  as->ldr(
+      a64::x0,
+      arch::ptr_resolve(as, arch::fp, send_value.loc, arch::reg_scratch_0));
+
+  asmjit::Label yield_label = as->newLabel();
+  if (skip_initial_send) {
+    as->b(yield_label);
+  } else {
+    // Setup call to JITRT_GenSend
+
+    // Put tstate and the current generator into X3 and X0 respectively, and
+    // set finish_yield_from (X2) to 0. This register setup matches that when
+    // `resume_label` is reached from the resume entry.
+    auto gen_offs = offsetof(GenDataFooter, gen);
+    as->mov(a64::x3, tstate_phys_reg);
+    as->ldr(
+        a64::x0,
+        arch::ptr_resolve(as, arch::fp, gen_offs, arch::reg_scratch_0));
+    as->mov(a64::x2, a64::xzr);
+  }
+
+  // Resumed execution begins here
+  auto resume_label = as->newLabel();
+  as->bind(resume_label);
+
+  // Save tstate from resume to callee-saved reigster.
+  as->mov(a64::x19, a64::x3);
+
+  // 'send_value', and 'finish_yield_from' will already be in X1 and X3
+  // respectively, either from code above on initial start or from resume entry
+  // point args.
+
+  // Load sub-iterator into X0
+  PhyLocation iter_slot = instr->getInput(2)->getStackSlot();
+  as->ldr(
+      a64::x0,
+      arch::ptr_resolve(as, arch::fp, iter_slot.loc, arch::reg_scratch_0));
+
+  uint64_t func = reinterpret_cast<uint64_t>(
+      instr->isYieldFromHandleStopAsyncIteration()
+          ? JITRT_GenSendHandleStopAsyncIteration
+          : JITRT_GenSend);
+  emitCall(*env, func, instr);
+  // Yielded or final result value now in X0. If the result was nullptr then
+  // done will be set so we'll correctly jump to the following CheckExc.
+  const auto yf_result_phys_reg = X0;
+  const auto done_r = a64::x2;
+
+  // Restore tstate from callee-saved register.
+  as->mov(tstate_phys_reg, a64::x19);
+
+  // If not done, jump to epilogue which will yield/return the value from
+  // JITRT_GenSend in X0.
+  asmjit::Label done_label = as->newLabel();
+  as->cbnz(done_r, done_label);
+
+  as->bind(yield_label);
+  // Arbitrary scratch register for use in emitStoreGenYieldPoint()
+  auto scratch_r = arch::reg_scratch_0;
+  emitStoreGenYieldPoint(as, env, instr, resume_label, arch::fp, scratch_r);
+  as->b(env->exit_for_yield_label);
 
   as->bind(done_label);
   emitLoadResumedYieldInputs(as, instr, yf_result_phys_reg, tstate_phys_reg);
@@ -764,6 +1178,18 @@ struct RegOperand {
       case 64:
         return asmjit::x86::gpq(reg.loc);
     }
+#elif defined(CINDER_AARCH64)
+    int size = Size == -1 ? LIROperandSizeMapper<N>(instr) : Size;
+
+    PhyLocation reg = LIROperandMapper<N>(instr)->getPhyRegister();
+    switch (size) {
+      case 8:
+      case 16:
+      case 32:
+        return asmjit::a64::w(reg.loc);
+      case 64:
+        return asmjit::a64::x(reg.loc);
+    }
 #else
     CINDER_UNSUPPORTED
 #endif
@@ -778,6 +1204,9 @@ struct VecDOperand {
   static arch::VecD GetAsmOperand(Environ*, const Instruction* instr) {
 #if defined(CINDER_X86_64)
     return asmjit::x86::xmm(
+        LIROperandMapper<N>(instr)->getPhyRegister().loc - VECD_REG_BASE);
+#elif defined(CINDER_AARCH64)
+    return asmjit::a64::d(
         LIROperandMapper<N>(instr)->getPhyRegister().loc - VECD_REG_BASE);
 #else
     CINDER_UNSUPPORTED
@@ -816,6 +1245,8 @@ arch::Mem AsmIndirectOperandBuilder(const OperandBase* operand) {
         indirect->getMultipiler(),
         indirect->getOffset());
   }
+#elif defined(CINDER_AARCH64)
+  JIT_ABORT("Unreachable.");
 #else
   CINDER_UNSUPPORTED
   return arch::Mem();
@@ -843,6 +1274,16 @@ struct MemOperand {
     }
 
     memptr.setSize(size);
+    return memptr;
+#elif defined(CINDER_AARCH64)
+    const OperandBase* operand = LIROperandMapper<N>(instr);
+    if (!operand->isStack()) {
+      JIT_ABORT("Unreachable.");
+    }
+
+    auto memptr = arch::ptr_offset(arch::fp, operand->getStackSlot().loc);
+    memptr.setSize(LIROperandSizeMapper<N>(instr) / 8);
+
     return memptr;
 #else
     CINDER_UNSUPPORTED
@@ -1321,6 +1762,1230 @@ BEGIN_RULES(Instruction::kSelect)
   GEN("Rrri", ASM(mov, OP(0), OP(3)),
               ASM(test, OP(1), OP(1)),
               ASM(cmovnz, OP(0), OP(2)))
+END_RULES
+
+BEGIN_RULES(Instruction::kIntToBool)
+  GEN("Rr", CALL_C(translateIntToBool))
+  GEN("Ri", CALL_C(translateIntToBool))
+END_RULES
+
+END_RULE_TABLE
+// clang-format on
+#elif defined(CINDER_AARCH64)
+
+namespace {
+
+using AT = AutoTranslator;
+
+// Resolve the memory address represented by a MemoryIndirect into the given
+// general-purpose register.
+void resolveMemoryIndirect(
+    Environ* env,
+    arch::Gp output,
+    const MemoryIndirect* indirect) {
+  a64::Builder* as = env->as;
+
+  auto baseRegOperand = indirect->getBaseRegOperand();
+  if (baseRegOperand->getPhyRegister() == SP) {
+    as->mov(output.x(), a64::sp);
+  } else {
+    as->mov(output.x(), AT::getGp(baseRegOperand));
+  }
+
+  auto indexRegOperand = indirect->getIndexRegOperand();
+  if (indexRegOperand != nullptr) {
+    auto index = AT::getGp(indexRegOperand);
+    auto multiplier = indirect->getMultipiler();
+
+    switch (multiplier) {
+      case 1:
+        as->add(output, output, index);
+        break;
+      case 2:
+        as->add(output, output, index, a64::lsl(1));
+        break;
+      case 4:
+        as->add(output, output, index, a64::lsl(2));
+        break;
+      case 8:
+        as->add(output, output, index, a64::lsl(3));
+        break;
+      default: {
+        auto scratch = arch::reg_scratch_0;
+        as->mov(scratch, multiplier);
+        as->mul(scratch, index, scratch);
+        as->add(output, output, scratch);
+        break;
+      }
+    }
+  }
+
+  auto offset = indirect->getOffset();
+  if (offset > 0) {
+    as->add(output, output, offset);
+  } else if (offset < 0) {
+    as->sub(output, output, -offset);
+  }
+}
+
+// Load the memory address represented by the MemoryIndirect into the given
+// general-purpose register.
+void loadMemoryIndirect(
+    Environ* env,
+    arch::Gp output,
+    const MemoryIndirect* indirect) {
+  a64::Builder* as = env->as;
+
+  if (indirect->getIndexRegOperand() == nullptr) {
+    as->ldr(
+        output.x(),
+        a64::ptr(
+            AT::getGp(indirect->getBaseRegOperand()), indirect->getOffset()));
+  } else {
+    resolveMemoryIndirect(env, arch::reg_scratch_0, indirect);
+    as->ldr(output.x(), a64::ptr(arch::reg_scratch_0));
+  }
+}
+
+// Store the value in the given general-purpose register into the memory address
+// represented by the MemoryIndirect.
+void storeMemoryIndirect(
+    Environ* env,
+    arch::Gp input,
+    const MemoryIndirect* indirect) {
+  a64::Builder* as = env->as;
+
+  if (indirect->getIndexRegOperand() == nullptr) {
+    as->str(
+        input.x(),
+        a64::ptr(
+            AT::getGp(indirect->getBaseRegOperand()), indirect->getOffset()));
+  } else {
+    resolveMemoryIndirect(env, arch::reg_scratch_0, indirect);
+    as->str(input.x(), a64::ptr(arch::reg_scratch_0));
+  }
+}
+
+void translateLea(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  auto output = instr->output();
+  auto input = instr->getInput(0);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+
+  if (input->isStack()) {
+    as->add(AT::getGp(output), arch::fp, input->getStackSlot().loc);
+  } else if (input->isMem()) {
+    auto address = reinterpret_cast<uint64_t>(input->getMemoryAddress());
+    as->mov(AT::getGp(output), address);
+  } else if (input->isInd()) {
+    resolveMemoryIndirect(env, AT::getGp(output), input->getMemoryIndirect());
+  } else {
+    JIT_ABORT("Unsupported operand type for Lea: {}", input->type());
+  }
+}
+
+void translateCall(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  auto output = instr->output();
+  auto input = instr->getInput(0);
+
+  if (input->isReg()) {
+    as->blr(AT::getGp(input));
+  } else if (input->isImm()) {
+    as->mov(arch::reg_scratch_br, input->getConstant());
+    as->blr(arch::reg_scratch_br);
+  } else if (input->isStack()) {
+    auto loc = input->getStackSlot().loc;
+    as->ldr(
+        arch::reg_scratch_br,
+        arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0));
+    as->blr(arch::reg_scratch_br);
+  } else {
+    JIT_ABORT("Unsupported operand type for Call: {}", input->type());
+  }
+
+  if (output->type() != OperandBase::kNone) {
+    as->mov(AT::getGp(output), a64::x0);
+  }
+}
+
+// Our move instruction encapsulates moving a value between registers, setting
+// the value of a register, loading a value from memory, and storing a value to
+// memory. The operation that will be performed is determined by the
+// input/output register combination. In general:
+//
+// * reg           + reg           = moving
+// * reg           + imm           = setting
+// * reg           + stack/mem/ind = loading
+// * stack/mem/ind + reg/imm       = storing
+//
+void translateMove(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+  auto scratch0 = arch::reg_scratch_0;
+  auto scratch1 = arch::reg_scratch_1;
+
+  const OperandBase* output = instr->output();
+  const OperandBase* input = instr->getInput(0);
+
+  switch (output->type()) {
+    case lir::OperandType::kReg:
+      switch (input->type()) {
+        case lir::OperandType::kReg:
+          // Moving a value from a register to a register.
+          if (output->isVecD()) {
+            if (input->isVecD()) {
+              as->fmov(AT::getVecD(output), AT::getVecD(input));
+            } else {
+              as->fmov(AT::getVecD(output), AT::getGp(input));
+            }
+          } else {
+            if (input->isVecD()) {
+              as->fmov(AT::getGp(output), AT::getVecD(input));
+            } else {
+              as->mov(AT::getGp(output), AT::getGp(input));
+            }
+          }
+          break;
+        case lir::OperandType::kStack: {
+          // Loading a value from the stack into a register.
+          auto ptr = arch::ptr_resolve(
+              as, arch::fp, input->getStackSlot().loc, arch::reg_scratch_0);
+          if (output->isVecD()) {
+            as->ldr(AT::getVecD(output), ptr);
+          } else {
+            as->ldr(AT::getGp(output), ptr);
+          }
+          break;
+        }
+        case lir::OperandType::kMem:
+          // Loading a value from an absolute address into a register.
+          as->mov(arch::reg_scratch_0, input->getMemoryAddress());
+          if (output->isVecD()) {
+            as->ldr(AT::getVecD(output), a64::ptr(arch::reg_scratch_0));
+          } else {
+            as->ldr(AT::getGp(output), a64::ptr(arch::reg_scratch_0));
+          }
+          break;
+        case lir::OperandType::kInd:
+          // Loading a value from an address relative to another register into
+          // a register.
+          if (output->isVecD()) {
+            resolveMemoryIndirect(env, scratch0, input->getMemoryIndirect());
+            as->ldr(AT::getVecD(output), a64::ptr(scratch0));
+          } else {
+            loadMemoryIndirect(
+                env, AT::getGp(output), input->getMemoryIndirect());
+          }
+          break;
+        case lir::OperandType::kImm:
+          // Loading a constant immediate into a register.
+          if (output->isVecD()) {
+            as->fmov(AT::getVecD(output), input->getConstant());
+          } else {
+            as->mov(AT::getGp(output), input->getConstant());
+          }
+          break;
+        case lir::OperandType::kNone:
+        case lir::OperandType::kVreg:
+        case lir::OperandType::kLabel:
+          JIT_ABORT(
+              "Unsupported operand type for Move: Reg + {}", input->type());
+      }
+      break;
+    case lir::OperandType::kStack: {
+      auto ptr = arch::ptr_resolve(
+          as, arch::fp, output->getStackSlot().loc, arch::reg_scratch_0);
+
+      if (input->isReg()) {
+        // Storing the value of a register to the stack.
+        if (input->isVecD()) {
+          as->str(AT::getVecD(input), ptr);
+        } else {
+          as->str(AT::getGp(input), ptr);
+        }
+      } else if (input->isImm()) {
+        // Storing a constant immediate to the stack.
+        as->mov(scratch0, input->getConstant());
+        as->str(scratch0, ptr);
+      } else {
+        JIT_ABORT("Unsupported operand type for Move: Stk + {}", input->type());
+      }
+      break;
+    }
+    case lir::OperandType::kMem:
+      as->mov(scratch0, reinterpret_cast<uint64_t>(output->getMemoryAddress()));
+
+      if (input->isReg()) {
+        // Storing the value of a register to an absolute address.
+        if (input->isVecD()) {
+          as->str(AT::getVecD(input), a64::ptr(scratch0));
+        } else {
+          as->str(AT::getGp(input), a64::ptr(scratch0));
+        }
+      } else if (input->isImm()) {
+        // Storing a constant immediate to an absolute address.
+        as->mov(scratch1, input->getConstant());
+        as->str(scratch1, a64::ptr(scratch0));
+      } else {
+        JIT_ABORT("Unsupported operand type for Move: Mem + {}", input->type());
+      }
+      break;
+    case lir::OperandType::kInd: {
+      if (input->isReg()) {
+        // Storing the value of a register to an address relative to another
+        // register.
+        if (input->isVecD()) {
+          resolveMemoryIndirect(env, scratch0, output->getMemoryIndirect());
+          as->str(AT::getVecD(input), a64::ptr(scratch0));
+        } else {
+          storeMemoryIndirect(
+              env, AT::getGp(input), output->getMemoryIndirect());
+        }
+      } else if (input->isImm()) {
+        // Storing a constant immediate to an address relative to another
+        // register.
+        as->mov(scratch1, input->getConstant());
+        storeMemoryIndirect(env, scratch1, output->getMemoryIndirect());
+      } else {
+        JIT_ABORT("Unsupported operand type for Move: Ind + {}", input->type());
+      }
+      break;
+    }
+    case lir::OperandType::kNone:
+    case lir::OperandType::kVreg:
+    case lir::OperandType::kImm:
+    case lir::OperandType::kLabel:
+      JIT_ABORT("Unsupported output operand type for Move: {}", output->type());
+  }
+}
+
+void translateMovZX(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  auto output = AT::getGp(instr->output());
+  const OperandBase* input = instr->getInput(0);
+  int input_size = input->sizeInBits();
+
+  if (input->isReg()) {
+    auto input_reg = AT::getGp(input);
+
+    switch (input_size) {
+      case 8:
+        as->uxtb(output, input_reg);
+        break;
+      case 16:
+        as->uxth(output, input_reg);
+        break;
+      case 32:
+        as->mov(a64::w(output.id()), a64::w(input_reg.id()));
+        break;
+      default:
+        JIT_ABORT("Unsupported input size for MovZX: {}", input_size);
+    }
+  } else if (input->isStack()) {
+    auto loc = input->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+
+    switch (input_size) {
+      case 8:
+        as->ldrb(output, ptr);
+        break;
+      case 16:
+        as->ldrh(output, ptr);
+        break;
+      case 32:
+        as->ldr(a64::w(output.id()), ptr);
+        break;
+      default:
+        JIT_ABORT("Unsupported input size for MovZX: {}", input_size);
+    }
+  } else {
+    JIT_ABORT("Unsupported operand type for MovZX: {}", input->type());
+  }
+}
+
+void translateMovSX(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  auto output = AT::getGp(instr->output());
+  const OperandBase* input = instr->getInput(0);
+  int input_size = input->sizeInBits();
+
+  if (input->isReg()) {
+    auto input_reg = AT::getGp(input);
+
+    switch (input_size) {
+      case 8:
+        as->sxtb(output, input_reg);
+        break;
+      case 16:
+        as->sxth(output, input_reg);
+        break;
+      case 32:
+        as->mov(a64::w(output.id()), a64::w(input_reg.id()));
+        break;
+      default:
+        JIT_ABORT("Unsupported input size for MovSX: {}", input_size);
+    }
+  } else if (input->isStack()) {
+    auto loc = input->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+
+    switch (input_size) {
+      case 8:
+        as->ldrsb(output, ptr);
+        break;
+      case 16:
+        as->ldrsh(output, ptr);
+        break;
+      case 32:
+        as->ldr(a64::w(output.id()), ptr);
+        break;
+      default:
+        JIT_ABORT("Unsupported input size for MovSX: {}", input_size);
+    }
+  } else {
+    JIT_ABORT("Unsupported operand type for MovSX: {}", input->type());
+  }
+}
+
+void translateMovSXD(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  auto output = AT::getGp(instr->output());
+  const OperandBase* input = instr->getInput(0);
+
+  if (input->isReg()) {
+    auto input_reg = AT::getGp(input);
+    as->sxtw(output, input_reg);
+  } else if (input->isStack()) {
+    auto loc = input->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+    as->ldrsw(output, ptr);
+  } else {
+    JIT_ABORT("Unsupported operand type for MovSXD: {}", input->type());
+  }
+}
+
+void translateUnreachable(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  as->udf(0);
+}
+
+void translateAdd(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+  JIT_CHECK(opnd0->isReg(), "Expected opnd0 to be a register");
+
+  auto output_reg = AT::getGp(output);
+  auto opnd0_reg = AT::getGp(opnd0);
+
+  if (opnd1->isImm()) {
+    uint64_t constant = opnd1->getConstant();
+    JIT_CHECK(arm::Utils::isAddSubImm(constant), "Out of range");
+
+    as->add(output_reg, opnd0_reg, constant);
+  } else if (opnd1->isReg()) {
+    as->add(output_reg, opnd0_reg, AT::getGp(opnd1));
+  } else if (opnd1->isStack()) {
+    auto loc = opnd1->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->add(output_reg, opnd0_reg, arch::reg_scratch_0);
+  } else {
+    JIT_ABORT("Unsupported operand type for Add: {}", opnd1->type());
+  }
+}
+
+void translateSub(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+  JIT_CHECK(opnd0->isReg(), "Expected opnd0 to be a register");
+
+  auto output_reg = AT::getGp(output);
+  auto opnd0_reg = AT::getGp(opnd0);
+
+  if (opnd1->isImm()) {
+    uint64_t constant = opnd1->getConstant();
+    JIT_CHECK(arm::Utils::isAddSubImm(constant), "Out of range");
+
+    as->sub(output_reg, opnd0_reg, constant);
+  } else if (opnd1->isReg()) {
+    as->sub(output_reg, opnd0_reg, AT::getGp(opnd1));
+  } else if (opnd1->isStack()) {
+    auto loc = opnd1->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->sub(output_reg, opnd0_reg, arch::reg_scratch_0);
+  } else {
+    JIT_ABORT("Unsupported operand type for Sub: {}", opnd1->type());
+  }
+}
+
+void translateAnd(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+  JIT_CHECK(opnd0->isReg(), "Expected opnd0 to be a register");
+
+  auto output_reg = AT::getGp(output);
+  auto opnd0_reg = AT::getGp(opnd0);
+
+  if (opnd1->isImm()) {
+    uint64_t constant = opnd1->getConstant();
+    uint32_t width = output->sizeInBits() <= 32 ? 32 : 64;
+    JIT_CHECK(arm::Utils::isLogicalImm(constant, width), "Invalid constant");
+
+    as->and_(output_reg, opnd0_reg, constant);
+  } else if (opnd1->isReg()) {
+    as->and_(output_reg, opnd0_reg, AT::getGp(opnd1));
+  } else if (opnd1->isStack()) {
+    auto loc = opnd1->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->and_(output_reg, opnd0_reg, arch::reg_scratch_0);
+  } else {
+    JIT_ABORT("Unsupported operand type for And: {}", opnd1->type());
+  }
+}
+
+void translateOr(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+  JIT_CHECK(opnd0->isReg(), "Expected opnd0 to be a register");
+
+  auto output_reg = AT::getGp(output);
+  auto opnd0_reg = AT::getGp(opnd0);
+
+  if (opnd1->isImm()) {
+    uint64_t constant = opnd1->getConstant();
+    uint32_t width = output->sizeInBits() <= 32 ? 32 : 64;
+    JIT_CHECK(arm::Utils::isLogicalImm(constant, width), "Invalid constant");
+
+    as->orr(output_reg, opnd0_reg, constant);
+  } else if (opnd1->isReg()) {
+    as->orr(output_reg, opnd0_reg, AT::getGp(opnd1));
+  } else if (opnd1->isStack()) {
+    auto loc = opnd1->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->orr(output_reg, opnd0_reg, arch::reg_scratch_0);
+  } else {
+    JIT_ABORT("Unsupported operand type for Or: {}", opnd1->type());
+  }
+}
+
+void translateXor(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+  JIT_CHECK(opnd0->isReg(), "Expected opnd0 to be a register");
+
+  auto output_reg = AT::getGp(output);
+  auto opnd0_reg = AT::getGp(opnd0);
+
+  if (opnd1->isImm()) {
+    uint64_t constant = opnd1->getConstant();
+    uint32_t width = output->sizeInBits() <= 32 ? 32 : 64;
+    JIT_CHECK(arm::Utils::isLogicalImm(constant, width), "Invalid constant");
+
+    as->eor(output_reg, opnd0_reg, constant);
+  } else if (opnd1->isReg()) {
+    as->eor(output_reg, opnd0_reg, AT::getGp(opnd1));
+  } else if (opnd1->isStack()) {
+    auto loc = opnd1->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->eor(output_reg, opnd0_reg, arch::reg_scratch_0);
+  } else {
+    JIT_ABORT("Unsupported operand type for Xor: {}", opnd1->type());
+  }
+}
+
+void translateMul(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+  JIT_CHECK(opnd0->isReg(), "Expected opnd0 to be a register");
+
+  auto output_reg = AT::getGp(output);
+  auto opnd0_reg = AT::getGp(opnd0);
+
+  if (opnd1->isImm()) {
+    as->mov(arch::reg_scratch_0, opnd1->getConstant());
+    as->mul(output_reg, opnd0_reg, arch::reg_scratch_0);
+  } else if (opnd1->isReg()) {
+    as->mul(output_reg, opnd0_reg, AT::getGp(opnd1));
+  } else if (opnd1->isStack()) {
+    auto loc = opnd1->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->mul(output_reg, opnd0_reg, arch::reg_scratch_0);
+  } else {
+    JIT_ABORT("Unsupported operand type for Mul: {}", opnd1->type());
+  }
+}
+
+void translateDiv(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+  JIT_CHECK(opnd0->isReg(), "Expected opnd0 to be a register");
+
+  auto output_reg = AT::getGp(output);
+  auto opnd0_reg = AT::getGp(opnd0);
+
+  if (opnd1->isReg()) {
+    as->sdiv(output_reg, opnd0_reg, AT::getGp(opnd1));
+  } else if (opnd1->isStack()) {
+    auto loc = opnd1->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->sdiv(output_reg, opnd0_reg, arch::reg_scratch_0);
+  } else {
+    JIT_ABORT("Unsupported operand type for Div: {}", opnd1->type());
+  }
+}
+
+void translateDivUn(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+  JIT_CHECK(opnd0->isReg(), "Expected opnd0 to be a register");
+
+  auto output_reg = AT::getGp(output);
+  auto opnd0_reg = AT::getGp(opnd0);
+
+  if (opnd1->isReg()) {
+    as->udiv(output_reg, opnd0_reg, AT::getGp(opnd1));
+  } else if (opnd1->isStack()) {
+    auto loc = opnd1->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_0);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->udiv(output_reg, opnd0_reg, arch::reg_scratch_0);
+  } else {
+    JIT_ABORT("Unsupported operand type for DivUn: {}", opnd1->type());
+  }
+}
+
+void translateFadd(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isVecD(), "Expected output to be a vector");
+  JIT_CHECK(opnd0->isVecD(), "Expected first input to be a vector");
+  JIT_CHECK(opnd1->isVecD(), "Expected second input to be a vector");
+
+  auto vec0 = AT::getVecD(output);
+  auto vec1 = AT::getVecD(opnd0);
+  auto vec2 = AT::getVecD(opnd1);
+
+  as->fadd(vec0, vec1, vec2);
+}
+
+void translateFsub(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isVecD(), "Expected output to be a vector");
+  JIT_CHECK(opnd0->isVecD(), "Expected first input to be a vector");
+  JIT_CHECK(opnd1->isVecD(), "Expected second input to be a vector");
+
+  auto vec0 = AT::getVecD(output);
+  auto vec1 = AT::getVecD(opnd0);
+  auto vec2 = AT::getVecD(opnd1);
+
+  as->fsub(vec0, vec1, vec2);
+}
+
+void translateFmul(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isVecD(), "Expected output to be a vector");
+  JIT_CHECK(opnd0->isVecD(), "Expected first input to be a vector");
+  JIT_CHECK(opnd1->isVecD(), "Expected second input to be a vector");
+
+  auto vec0 = AT::getVecD(output);
+  auto vec1 = AT::getVecD(opnd0);
+  auto vec2 = AT::getVecD(opnd1);
+
+  as->fmul(vec0, vec1, vec2);
+}
+
+void translateFdiv(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* output =
+      instr->getNumOutputs() > 0 ? instr->output() : instr->getInput(0);
+  const OperandBase* opnd0 = instr->getInput(0);
+  const OperandBase* opnd1 = instr->getInput(1);
+
+  JIT_CHECK(output->isVecD(), "Expected output to be a vector");
+  JIT_CHECK(opnd0->isVecD(), "Expected first input to be a vector");
+  JIT_CHECK(opnd1->isVecD(), "Expected second input to be a vector");
+
+  auto vec0 = AT::getVecD(output);
+  auto vec1 = AT::getVecD(opnd0);
+  auto vec2 = AT::getVecD(opnd1);
+
+  as->fdiv(vec0, vec1, vec2);
+}
+
+void translatePush(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* operand = instr->getInput(0);
+
+  if (operand->isImm()) {
+    as->mov(arch::reg_scratch_0, operand->getConstant());
+    as->str(arch::reg_scratch_0, a64::ptr_pre(a64::sp, -16));
+  } else if (operand->isReg()) {
+    auto reg = AT::getGp(operand);
+    as->str(reg, a64::ptr_pre(a64::sp, -16));
+  } else if (operand->isStack()) {
+    auto loc = operand->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_1);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->str(arch::reg_scratch_0, a64::ptr_pre(a64::sp, -16));
+  } else {
+    JIT_ABORT("Unsupported operand type for push: {}", operand->type());
+  }
+}
+
+void translatePop(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* operand = instr->output();
+
+  if (operand->isReg()) {
+    auto reg = AT::getGp(operand);
+    as->ldr(reg, a64::ptr_post(a64::sp, 16));
+  } else if (operand->isStack()) {
+    auto loc = operand->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_1);
+    as->ldr(arch::reg_scratch_0, a64::ptr_post(a64::sp, 16));
+    as->str(arch::reg_scratch_0, ptr);
+  } else {
+    JIT_ABORT("Unsupported operand type for pop: {}", operand->type());
+  }
+}
+
+void translateExchange(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* opnd0 = instr->output();
+  const OperandBase* opnd1 = instr->getInput(0);
+
+  JIT_CHECK(opnd0->isReg(), "Expected opnd0 to be a register");
+  JIT_CHECK(opnd1->isReg(), "Expected opnd1 to be a register");
+
+  if (opnd0->isVecD() && opnd1->isVecD()) {
+    auto vec0 = AT::getVecD(opnd0);
+    auto vec1 = AT::getVecD(opnd1);
+
+    as->eor(vec0.v16(), vec0.v16(), vec1.v16());
+    as->eor(vec1.v16(), vec1.v16(), vec0.v16());
+    as->eor(vec0.v16(), vec0.v16(), vec1.v16());
+  } else {
+    auto reg0 = AT::getGp(opnd0);
+    auto reg1 = AT::getGp(opnd1);
+    auto scratch = arch::reg_scratch_0;
+
+    as->mov(scratch, reg0);
+    as->mov(reg0, reg1);
+    as->mov(reg1, scratch);
+  }
+}
+
+void translateCmp(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  const OperandBase* inp0 = instr->getInput(0);
+  const OperandBase* inp1 = instr->getInput(1);
+
+  JIT_CHECK(inp0->isReg(), "Expected first input to be a register");
+
+  if (inp1->isReg()) {
+    if (inp0->isVecD() && inp1->isVecD()) {
+      as->fcmp(AT::getVecD(inp0), AT::getVecD(inp1));
+    } else {
+      as->cmp(AT::getGp(inp0), AT::getGp(inp1));
+    }
+  } else if (inp1->isImm()) {
+    auto constant = inp1->getConstant();
+
+    if (arm::Utils::isAddSubImm(constant)) {
+      as->cmp(AT::getGp(inp0), constant);
+    } else {
+      as->mov(arch::reg_scratch_0, constant);
+      as->cmp(AT::getGp(inp0), arch::reg_scratch_0);
+    }
+  } else {
+    JIT_ABORT(
+        "Unsupported operand types for cmp: {} {}", inp0->type(), inp1->type());
+  }
+}
+
+void translateInc(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  auto opnd = instr->getInput(0);
+
+  if (opnd->isReg()) {
+    // We have to do adds here, because implicitly our LIR relies on the Inc
+    // instruction setting flags.
+    as->adds(AT::getGp(opnd), AT::getGp(opnd), 1);
+  } else if (opnd->isStack()) {
+    auto loc = opnd->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_1);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->add(arch::reg_scratch_0, arch::reg_scratch_0, 1);
+    as->str(arch::reg_scratch_0, ptr);
+  } else {
+    JIT_ABORT("Unsupported operand type for inc: {}", opnd->dataType());
+  }
+}
+
+void translateDec(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  auto opnd = instr->getInput(0);
+
+  if (opnd->isReg()) {
+    // We have to do subs here, because implicitly our LIR relies on the Dec
+    // instruction setting flags.
+    as->subs(AT::getGp(opnd), AT::getGp(opnd), 1);
+  } else if (opnd->isStack()) {
+    auto loc = opnd->getStackSlot().loc;
+    auto ptr = arch::ptr_resolve(as, arch::fp, loc, arch::reg_scratch_1);
+    as->ldr(arch::reg_scratch_0, ptr);
+    as->sub(arch::reg_scratch_0, arch::reg_scratch_0, 1);
+    as->str(arch::reg_scratch_0, ptr);
+  } else {
+    JIT_ABORT("Unsupported operand type for dec: {}", opnd->dataType());
+  }
+}
+
+void translateBitTest(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  auto test_reg = AT::getGp(instr->getInput(0));
+  auto bit_pos = instr->getInput(1)->getConstant();
+
+  uint64_t mask = 1ULL << bit_pos;
+  JIT_CHECK(
+      arm::Utils::isLogicalImm(mask, 64),
+      "All single bits should be able to be tested");
+
+  as->tst(test_reg, mask);
+}
+
+void translateSelect(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  auto output = AT::getGp(instr->output());
+  auto condition_reg = AT::getGp(instr->getInput(0));
+  auto true_val_reg = AT::getGp(instr->getInput(1));
+  auto false_val = instr->getInput(2)->getConstant();
+
+  as->mov(arch::reg_scratch_0, false_val);
+  as->cmp(condition_reg, 0);
+  as->csel(output, true_val_reg, arch::reg_scratch_0, a64::CondCode::kNE);
+}
+
+} // namespace
+
+// clang-format off
+BEGIN_RULE_TABLE
+
+BEGIN_RULES(Instruction::kLea)
+  GEN("Rm", CALL_C(translateLea))
+END_RULES
+
+BEGIN_RULES(Instruction::kCall)
+  GEN("Ri", CALL_C(translateCall))
+  GEN("Rr", CALL_C(translateCall))
+  GEN("i", CALL_C(translateCall))
+  GEN("r", CALL_C(translateCall))
+  GEN("m", CALL_C(translateCall))
+END_RULES
+
+BEGIN_RULES(Instruction::kMove)
+  GEN("Rr", CALL_C(translateMove))
+  GEN("Ri", CALL_C(translateMove))
+  GEN("Rm", CALL_C(translateMove))
+  GEN("Mr", CALL_C(translateMove))
+  GEN("Mi", CALL_C(translateMove))
+  GEN("Xx", CALL_C(translateMove))
+  GEN("Xm", CALL_C(translateMove))
+  GEN("Mx", CALL_C(translateMove))
+  GEN("Xr", CALL_C(translateMove))
+  GEN("Rx", CALL_C(translateMove))
+END_RULES
+
+BEGIN_RULES(Instruction::kGuard)
+  GEN(ANY, CALL_C(TranslateGuard))
+END_RULES
+
+BEGIN_RULES(Instruction::kDeoptPatchpoint)
+  GEN(ANY, CALL_C(TranslateDeoptPatchpoint))
+END_RULES
+
+BEGIN_RULES(Instruction::kNegate)
+  GEN("r", ASM(neg, OP(0), OP(0)))
+  GEN("Ri", ASM(mov, OP(0), ImmOperandNegate<OP(1)>))
+  GEN("Rr", ASM(neg, OP(0), OP(1)))
+  GEN("Rm", ASM(ldr, OP(0), STK(1)), ASM(neg, OP(0), OP(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kInvert)
+  GEN("Ri", ASM(mov, OP(0), ImmOperandInvert<OP(1)>))
+  GEN("Rr", ASM(mvn, OP(0), OP(1)))
+  GEN("Rm", ASM(ldr, OP(0), STK(1)), ASM(mvn, OP(0), OP(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kMovZX)
+  GEN("Rr", CALL_C(translateMovZX))
+  GEN("Rm", CALL_C(translateMovZX))
+END_RULES
+
+BEGIN_RULES(Instruction::kMovSX)
+  GEN("Rr", CALL_C(translateMovSX))
+  GEN("Rm", CALL_C(translateMovSX))
+END_RULES
+
+BEGIN_RULES(Instruction::kMovSXD)
+  GEN("Rr", CALL_C(translateMovSXD))
+  GEN("Rm", CALL_C(translateMovSXD))
+END_RULES
+
+BEGIN_RULES(Instruction::kUnreachable)
+  GEN(ANY, CALL_C(translateUnreachable))
+END_RULES
+
+BEGIN_RULES(Instruction::kAdd)
+  GEN("ri", CALL_C(translateAdd))
+  GEN("rr", CALL_C(translateAdd))
+  GEN("rm", CALL_C(translateAdd))
+  GEN("Rri", CALL_C(translateAdd))
+  GEN("Rrr", CALL_C(translateAdd))
+  GEN("Rrm", CALL_C(translateAdd))
+END_RULES
+
+BEGIN_RULES(Instruction::kSub)
+  GEN("ri", CALL_C(translateSub))
+  GEN("rr", CALL_C(translateSub))
+  GEN("rm", CALL_C(translateSub))
+  GEN("Rri", CALL_C(translateSub))
+  GEN("Rrr", CALL_C(translateSub))
+  GEN("Rrm", CALL_C(translateSub))
+END_RULES
+
+BEGIN_RULES(Instruction::kAnd)
+  GEN("ri", CALL_C(translateAnd))
+  GEN("rr", CALL_C(translateAnd))
+  GEN("rm", CALL_C(translateAnd))
+  GEN("Rri", CALL_C(translateAnd))
+  GEN("Rrr", CALL_C(translateAnd))
+  GEN("Rrm", CALL_C(translateAnd))
+END_RULES
+
+BEGIN_RULES(Instruction::kOr)
+  GEN("ri", CALL_C(translateOr))
+  GEN("rr", CALL_C(translateOr))
+  GEN("rm", CALL_C(translateOr))
+  GEN("Rri", CALL_C(translateOr))
+  GEN("Rrr", CALL_C(translateOr))
+  GEN("Rrm", CALL_C(translateOr))
+END_RULES
+
+BEGIN_RULES(Instruction::kXor)
+  GEN("ri", CALL_C(translateXor))
+  GEN("rr", CALL_C(translateXor))
+  GEN("rm", CALL_C(translateXor))
+  GEN("Rri", CALL_C(translateXor))
+  GEN("Rrr", CALL_C(translateXor))
+  GEN("Rrm", CALL_C(translateXor))
+END_RULES
+
+BEGIN_RULES(Instruction::kMul)
+  GEN("ri", CALL_C(translateMul))
+  GEN("rr", CALL_C(translateMul))
+  GEN("rm", CALL_C(translateMul))
+  GEN("Rri", CALL_C(translateMul))
+  GEN("Rrr", CALL_C(translateMul))
+  GEN("Rrm", CALL_C(translateMul))
+END_RULES
+
+BEGIN_RULES(Instruction::kDiv)
+  GEN("rrr", CALL_C(translateDiv))
+  GEN("rrm", CALL_C(translateDiv))
+  GEN("rr", CALL_C(translateDiv))
+  GEN("rm", CALL_C(translateDiv))
+END_RULES
+
+BEGIN_RULES(Instruction::kDivUn)
+  GEN("rrr", CALL_C(translateDivUn))
+  GEN("rrm", CALL_C(translateDivUn))
+  GEN("rr", CALL_C(translateDivUn))
+  GEN("rm", CALL_C(translateDivUn))
+END_RULES
+
+BEGIN_RULES(Instruction::kFadd)
+  GEN("Xxx", CALL_C(translateFadd))
+  GEN("xx", CALL_C(translateFadd))
+END_RULES
+
+BEGIN_RULES(Instruction::kFsub)
+  GEN("Xxx", CALL_C(translateFsub))
+  GEN("xx", CALL_C(translateFsub))
+END_RULES
+
+BEGIN_RULES(Instruction::kFmul)
+  GEN("Xxx", CALL_C(translateFmul))
+  GEN("xx", CALL_C(translateFmul))
+END_RULES
+
+BEGIN_RULES(Instruction::kFdiv)
+  GEN("Xxx", CALL_C(translateFdiv))
+  GEN("xx", CALL_C(translateFdiv))
+END_RULES
+
+BEGIN_RULES(Instruction::kPush)
+  GEN("r", CALL_C(translatePush))
+  GEN("m", CALL_C(translatePush))
+  GEN("i", CALL_C(translatePush))
+END_RULES
+
+BEGIN_RULES(Instruction::kPop)
+  GEN("R", CALL_C(translatePop))
+  GEN("M", CALL_C(translatePop))
+END_RULES
+
+BEGIN_RULES(Instruction::kExchange)
+  GEN("Rr", CALL_C(translateExchange))
+  GEN("Xx", CALL_C(translateExchange))
+END_RULES
+
+BEGIN_RULES(Instruction::kCmp)
+  GEN("rr", CALL_C(translateCmp))
+  GEN("ri", CALL_C(translateCmp))
+  GEN("xx", CALL_C(translateCmp))
+END_RULES
+
+BEGIN_RULES(Instruction::kTest)
+  GEN("rr", ASM(tst, OP(0), OP(1)))
+END_RULES
+
+BEGIN_RULES(Instruction::kTest32)
+  GEN("rr", ASM(tst, REG_OP(0, 32), REG_OP(1, 32)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranch)
+  GEN("b", ASM(b, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchZ)
+  GEN("b", ASM(b_eq, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchNZ)
+  GEN("b", ASM(b_ne, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchA)
+  GEN("b", ASM(b_hi, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchB)
+  GEN("b", ASM(b_lo, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchAE)
+  GEN("b", ASM(b_hs, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchBE)
+  GEN("b", ASM(b_ls, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchG)
+  GEN("b", ASM(b_gt, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchL)
+  GEN("b", ASM(b_lt, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchGE)
+  GEN("b", ASM(b_ge, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchLE)
+  GEN("b", ASM(b_le, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchC)
+  GEN("b", ASM(b_cs, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchNC)
+  GEN("b", ASM(b_cc, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchO)
+  GEN("b", ASM(b_vs, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchNO)
+  GEN("b", ASM(b_vc, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchS)
+  GEN("b", ASM(b_mi, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchNS)
+  GEN("b", ASM(b_pl, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchE)
+  GEN("b", ASM(b_eq, LBL(0)))
+END_RULES
+
+BEGIN_RULES(Instruction::kBranchNE)
+  GEN("b", ASM(b_ne, LBL(0)))
+END_RULES
+
+#define DEF_COMPARE_OP_RULES(name, fpcomp) \
+BEGIN_RULES(Instruction::name) \
+  GEN("Rrr", CALL_C(TranslateCompare)) \
+  GEN("Rri", CALL_C(TranslateCompare)) \
+  GEN("Rrm", CALL_C(TranslateCompare)) \
+  if (fpcomp) { \
+    GEN("Rxx", CALL_C(TranslateCompare)) \
+  } \
+END_RULES
+
+DEF_COMPARE_OP_RULES(kEqual, true)
+DEF_COMPARE_OP_RULES(kNotEqual, true)
+DEF_COMPARE_OP_RULES(kGreaterThanUnsigned, true)
+DEF_COMPARE_OP_RULES(kGreaterThanEqualUnsigned, true)
+DEF_COMPARE_OP_RULES(kLessThanUnsigned, true)
+DEF_COMPARE_OP_RULES(kLessThanEqualUnsigned, true)
+DEF_COMPARE_OP_RULES(kGreaterThanSigned, false)
+DEF_COMPARE_OP_RULES(kGreaterThanEqualSigned, false)
+DEF_COMPARE_OP_RULES(kLessThanSigned, false)
+DEF_COMPARE_OP_RULES(kLessThanEqualSigned, false)
+
+#undef DEF_COMPARE_OP_RULES
+
+BEGIN_RULES(Instruction::kInc)
+  GEN("r", CALL_C(translateInc))
+  GEN("m", CALL_C(translateInc))
+END_RULES
+
+BEGIN_RULES(Instruction::kDec)
+  GEN("r", CALL_C(translateDec))
+  GEN("m", CALL_C(translateDec))
+END_RULES
+
+BEGIN_RULES(Instruction::kBitTest)
+  GEN("ri", CALL_C(translateBitTest));
+END_RULES
+
+BEGIN_RULES(Instruction::kYieldInitial)
+  GEN(ANY, CALL_C(translateYieldInitial))
+END_RULES
+
+#if PY_VERSION_HEX < 0x030C0000
+BEGIN_RULES(Instruction::kYieldFrom)
+  GEN(ANY, CALL_C(translateYieldFrom))
+END_RULES
+#else
+// In 3.12+ YieldFrom is a pseudo-op which is YieldValue plus enough
+// information to know which live value contains the target iterator. See
+// emitStoreGenYieldPoint() for where this is captured. The target iterator is
+// used for things like the result of reading gi_yieldfrom.
+BEGIN_RULES(Instruction::kYieldFrom)
+  GEN(ANY, CALL_C(translateYieldValue))
+END_RULES
+#endif
+
+BEGIN_RULES(Instruction::kYieldFromSkipInitialSend)
+  GEN(ANY, CALL_C(translateYieldFrom))
+END_RULES
+
+BEGIN_RULES(Instruction::kYieldFromHandleStopAsyncIteration)
+  GEN(ANY, CALL_C(translateYieldFrom))
+END_RULES
+
+BEGIN_RULES(Instruction::kYieldValue)
+  GEN(ANY, CALL_C(translateYieldValue))
+END_RULES
+
+BEGIN_RULES(Instruction::kSelect)
+  GEN("Rrri", CALL_C(translateSelect))
 END_RULES
 
 BEGIN_RULES(Instruction::kIntToBool)
